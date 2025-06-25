@@ -204,7 +204,7 @@ $$(BUILDDIR)/$(1)/$(2).elf: $$(OBJS_$(1)) $$(LIBS_$(1)) $$(SYSTEM_LIBS_$(1)) $$(
 	    -nostdlib\
 	    -Wl,--start-group $$(OBJS_$(1)) $$(LIBS_$(1)) $$(SYSTEM_LIBS_$(1)) $$(SYSTEM_LIBS_CXX_$(1)) -Wl,--end-group\
 	    -Wl,-Map=$$(BUILDDIR)/$(1)/$(2).Map\
-	    -o $$@
+	    -o $$@ $$(SHARED_LIBRARIES)
 
 # NOTE: This rule creates an lst file for the elf as flashed on the board
 #       (i.e. at address 0x80000000). This is not likely what you want.

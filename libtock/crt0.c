@@ -1,4 +1,6 @@
 #include "tock.h"
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,6 +20,22 @@ extern int main(int argc, char* argv[]);
 // Allow _start to go undeclared
 #pragma GCC diagnostic ignored "-Wmissing-declarations"
 #pragma GCC diagnostic ignored "-Wmissing-prototypes"
+
+#define DRIVER_NUM_SHARED_LIBRARY_LOOKUP 0x10001
+
+#define SHLIB_DEBUG
+
+// Reserve the register r10 to hold the PIC base address for the shared
+// library support.
+// Similar to how we reserve r9 for the app PIC base address. Unlike the application, the shared library is compiled with -mpic-register=r10.
+// This register declaration prevents GCC from generating code that will
+// clobber r10 in non-shared library code.
+// gcc.gnu.org/onlinedocs/gcc-4.6.1/gcc/Explicit-Reg-Vars.html#Explicit-Reg-Vars
+// In the future, reserving this extra register could be avoided by sharing r9
+// as the single PIC base register for both the application and shared 
+// library, but that would require more extensive changes to the toolchain 
+// in order to preserve the different PIC base values across function calls.
+register uint32_t *shlib_pic_base asm ("r10");
 
 // The structure populated by the linker script at the very beginning of the
 // text segment. It represents sizes and offsets from the text segment of
@@ -326,6 +344,124 @@ void _c_start_pic(uint32_t app_start, uint32_t mem_start) {
       *target = (*target ^ 0x80000000) + app_start;
     }
   }
+
+  syscall_return_t flash_info = command(DRIVER_NUM_SHARED_LIBRARY_LOOKUP, 1, 0, 0);
+  uint32_t shlib_flash_pre_hdr_start = (uint32_t)flash_info.data[0];
+  uint32_t shlib_flash_tbf_hdr_len = (uint32_t)flash_info.data[1];
+  uint32_t shlib_flash_start = shlib_flash_pre_hdr_start + shlib_flash_tbf_hdr_len;
+
+  syscall_return_t mem_info = command(DRIVER_NUM_SHARED_LIBRARY_LOOKUP, 2, 0, 0);
+  uint32_t shlib_mem_start = (uint32_t)mem_info.data[0];
+
+#ifdef SHLIB_DEBUG
+  printf("Shared library flash start: %p\n", (uint32_t*)shlib_flash_start);
+  printf("Shared library mem start: %p\n", (uint32_t*)shlib_mem_start);
+#endif
+
+  struct hdr* shlib_hdr = (struct hdr*)shlib_flash_start;
+
+#ifdef SHLIB_DEBUG
+  printf("Shared library crt0 header: \n\t%p\n\t%p\n\t%p\n\t%p\n\t%p\n\t%p\n\t%p\n\t%p\n\t%p\n", 
+          (uint32_t*)shlib_hdr->got_sym_start,
+          (uint32_t*)shlib_hdr->got_start,
+          (uint32_t*)shlib_hdr->got_size,
+          (uint32_t*)shlib_hdr->data_sym_start,
+          (uint32_t*)shlib_hdr->data_start,
+          (uint32_t*)shlib_hdr->data_size,
+          (uint32_t*)shlib_hdr->bss_start,
+          (uint32_t*)shlib_hdr->bss_size,
+          (uint32_t*)shlib_hdr->reldata_start);
+#endif
+
+  // Get the address in memory of where the table should go.
+  uint32_t* shlib_got_start = (uint32_t*)(shlib_hdr->got_start + shlib_mem_start);
+  // Get the address in flash of where the table currently is.
+  uint32_t* shlib_got_sym_start = (uint32_t*)(shlib_hdr->got_sym_start + shlib_flash_start);
+
+#ifdef SHLIB_DEBUG
+  printf("app  mem_start %p; app app_start %p\n", (uint32_t*)mem_start, (uint32_t*)app_start);
+  printf("App has GOT from %p - %p\n", (uint32_t*)got_sym_start, (uint32_t*)((uint32_t)got_sym_start + myhdr->got_size));
+  printf("\t Relocating to %p - %p\n", (uint32_t*)got_start, (uint32_t*)((uint32_t)got_start + myhdr->got_size));
+  printf("Shared library has GOT from %p - %p\n", (uint32_t*)shlib_got_sym_start, (uint32_t*)((uint32_t)shlib_got_sym_start + shlib_hdr->got_size));
+  printf("\t Relocating to %p - %p\n", (uint32_t*)shlib_got_start, (uint32_t*)((uint32_t)shlib_got_start + shlib_hdr->got_size));
+#endif
+
+  // Iterate all entries in the table and correct the addresses.
+  for (uint32_t i = 0; i < (shlib_hdr->got_size / (uint32_t)sizeof(uint32_t)); i++) {
+    // Use the sentinel here. If the most significant bit is 0, then we know
+    // this offset is pointing to an address in memory. If the MSB is 1, then
+    // the offset refers to a value in flash.
+    if ((shlib_got_sym_start[i] & 0x80000000) == 0) {
+      // This is an address for something in memory, and we need to correct the
+      // address now that we know where this app is actually running in memory.
+      // This equation is really:
+      //
+      //     got_entry = (got_stored_entry - original_RAM_start_address) + actual_RAM_start_address
+      //
+      // However, we compiled the app where `original_RAM_start_address` is 0x0,
+      // so we can omit that.
+      shlib_got_start[i] = shlib_got_sym_start[i] + shlib_mem_start + shlib_hdr->got_size + (i * sizeof(uint32_t));
+#ifdef SHLIB_DEBUG
+      // printf("Setting shlib GOT entry %p to %p\n", &shlib_got_start[i], (uint32_t*)shlib_got_start[i]);
+#endif
+    } else {
+      // Otherwise, this address refers to something in flash. Now that we know
+      // where the app has actually been loaded, we can reference from the
+      // actual `app_start` address. We also have to remove our fake flash
+      // address sentinel (by ORing with 0x80000000).
+      shlib_got_start[i] = (shlib_got_sym_start[i] ^ 0x80000000) + shlib_flash_start + shlib_hdr->got_size;
+    }
+  }
+
+  // Load the data section from flash into RAM. We use the offsets from our
+  // crt0 header so we know where this starts and where it should go.
+  void* shlib_data_start     = (void*)(shlib_hdr->data_start + shlib_mem_start);
+  void* shlib_data_sym_start = (void*)(shlib_hdr->data_sym_start + shlib_flash_start);
+  memcpy(shlib_data_start, shlib_data_sym_start, shlib_hdr->data_size);
+
+  // Zero BSS segment. Again, we know where this should be in the process RAM
+  // based on the crt0 header.
+  char* shlib_bss_start = (char*)(shlib_hdr->bss_start + shlib_mem_start);
+  memset(shlib_bss_start, 0, shlib_hdr->bss_size);
+
+  // Do relative data address fixups. We know these entries are stored at the end
+  // of flash and can be located using the crt0 header.
+  //
+  // The data structure used for these is `struct reldata`, where a 32 bit
+  // length field is followed by that many entries. We iterate each entry and
+  // correct addresses.
+  // struct reldata* rd = (struct reldata*)(myhdr->reldata_start + (uint32_t)app_start + 0x28);
+  struct reldata* shlib_rd = (struct reldata*)(shlib_hdr->reldata_start + (uint32_t)shlib_flash_start);
+#ifdef SHLIB_DEBUG
+  printf("Shared library reldata at %p with length %lu\n", shlib_rd, shlib_rd->len);
+#endif
+  for (uint32_t i = 0; i < (shlib_rd->len / (int)sizeof(uint32_t)); i += 2) {
+    // The entries are offsets from the beginning of the app's memory region.
+    // First, we get a pointer to the location of the address we need to fix.
+    uint32_t* target = (uint32_t*)(shlib_rd->data[i] + shlib_mem_start);
+    if ((*target & 0x80000000) == 0) {
+      // Again, we use our sentinel. If the address at that location has a MSB
+      // of 0, then we know this is an address in RAM. We need to fix the
+      // address by including the offset where the app actual ended up in
+      // memory. This is a simple addition since the app was compiled with a
+      // memory address of zero.
+      *target += shlib_mem_start;
+    } else {
+      // When the MSB is 1, the address is in flash. We clear our sentinel, and
+      // then make the address an offset from the start of where the app is
+      // located in flash.
+      *target = (*target ^ 0x80000000) + shlib_flash_start;
+    }
+  }
+
+  volatile uint32_t shlib_got_start_addr = (uint32_t)(shlib_got_start);
+  __asm__ volatile (
+    "mov r10, %[debug]\n" : [debug] "+r" (shlib_got_start_addr)
+  );
+
+#ifdef SHLIB_DEBUG
+  printf("Set shared library PIC base register r10 to %p\n", (uint32_t*)shlib_got_start_addr);
+#endif
 
   exit(main(0, NULL));
 }

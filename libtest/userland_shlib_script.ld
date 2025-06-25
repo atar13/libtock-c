@@ -8,7 +8,8 @@
 PROG_LENGTH = 0x00070000;
 RAM_LENGTH  = 0x00010000;
 
-ENTRY(_start)
+/* no _start entrypoint for shared library */
+/* ENTRY(_start) */
 
 /* Note: On platforms where apps are position-independent and relocatable, the
  * FLASH address here acts as a sentinel value for relocation fixup routines.
@@ -22,7 +23,6 @@ MEMORY {
 }
 
 SECTIONS {
-    /DISCARD/ : { *(.interp) }
     /* Section for just the app crt0 header.
      * This must be first so that the app can find it.
      */
@@ -69,19 +69,8 @@ SECTIONS {
          * .rel.data section */
         LONG(LOADADDR(.endflash) - ORIGIN(FLASH));
         /* The size of the stack requested by this application */
-        LONG(STACK_SIZE);
+        LONG(0x00);
     } > FLASH =0xFF
-
-    /* App state section. Used for persistent app data.
-     * We put this first so that if the app code changes but the persistent
-     * data doesn't, the app_state can be preserved.
-     */
-    .wfr.app_state :
-    {
-        KEEP (*(.app_state))
-        . = ALIGN(4); /* Make sure we're word-aligned here */
-    } > FLASH =0xFF
-
     /* Text section, Code! */
     .text :
     {
@@ -96,36 +85,6 @@ SECTIONS {
         *(.ARM.extab*)
         . = ALIGN(4); /* Make sure we're word-aligned here */
     } > FLASH =0xFF
-
-    /* Need to reserve room for the stack in the linker file. This makes the
-     * _got addresses used by the compiler match what they will be when the
-     * app is loaded into memory. This is not necessary for full PIC supported
-     * platforms (like Cortex-M), but is needed when an app is compiled for a
-     * fixed address.
-     */
-    .stack :
-    {
-        /* elf2tab requires that the `_SRAM_ORIGIN` symbol be present to
-		 * mark the first address in the SRAM memory. Since ELF files do
-		 * not really need to specify this address as they only care about
-		 * loading into flash, we need to manually mark this address for
-		 * elf2tab. elf2tab will use it to add a fixed address header in the
-		 * TBF header if needed.
-		 */
-	    _sram_origin = .;
-
-        /* Be conservative about our alignment for the stack. Different
-         * architectures require different values (8 for ARM, 16 for RISC-V),
-         * so we choose the largest value. In practice, this likely will not
-         * matter since the start of SRAM is unlikely to be at a very peculiar
-         * address.
-         */
-        . = ALIGN(16);
-        _stack = .;
-        . = _stack + STACK_SIZE;
-        . = ALIGN(16);
-    } > SRAM
-
 
     /* Global Offset Table */
     .got :
@@ -164,24 +123,6 @@ SECTIONS {
         . = ALIGN(4);
     } > SRAM
 
-
-
-    /*
-     * Need for shared libraries.
-     * Without this .rel.dyn declartion, for some reason GCC added 
-     * .rel.dyn to the end of the binary without increasing the .endflash
-     * value. Since the reldata_start field of the crt0_header depends
-     * on the value of .endflash, we explicitly declare .rel.dyn to be 
-     * before the end of flash so that it gets accounted for and .endflash
-     * actually points to the end of flash.
-    */
-    .rel.dyn :
-    {
-        . = ALIGN(4); 
-        *(.rel.dyn*)
-        . = ALIGN(4); 
-    } > FLASH
-
     /* End of flash. */
     .endflash :
     {
@@ -212,9 +153,19 @@ SECTIONS {
       *(.ARM.exidx* .gnu.linkonce.armexidx.*)
     } > FLASH
     PROVIDE_HIDDEN (__exidx_end = .);
+
+    /DISCARD/ : {
+      *(.interp)
+      *(.dynsym)
+      *(.dynstr)
+      *(.hash)
+      *(.gnu.hash)
+      *(.header)
+    } : phdr
 }
 
 ASSERT(_got <= _bss, "
 The GOT section must be before the BSS section for crt0 setup to be correct.");
 ASSERT(_data <= _bss, "
 The data section must be before the BSS section for crt0 setup to be correct.");
+

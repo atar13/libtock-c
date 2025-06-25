@@ -1,0 +1,239 @@
+################################################################################
+##
+## libtock-c shared library makefile. Included by shared library makefiles to build
+##  libraries for use with libtock-c apps.
+## Unlike TockLibrary.mk, this Makefile produces shared libraries or .so files
+##   which require dynamic loading.
+##
+################################################################################
+
+# The first target Make finds is its default. So this line needs to be first to
+# specify `all` as our default rule.
+all:
+
+# Build settings.
+include $(TOCK_USERLAND_BASE_DIR)/Configuration.mk
+
+# Helper functions.
+include $(TOCK_USERLAND_BASE_DIR)/Helpers.mk
+
+# Targets for fetching pre-compiled libraries.
+include $(TOCK_USERLAND_BASE_DIR)/Precompiled.mk
+
+# IMPORTANT FOR SHARED LIBRARIES
+# OVERRIDE CPPFLAGS_cortex-m with equals sign (NOT +=)
+# Originally defined in Configuration.mk but we need 
+# to override the -mpic-register flag
+override CPPFLAGS_cortex-m = \
+      $(CPPFLAGS_toolchain_cortex-m)\
+      $(CPPFLAGS_PIC)\
+      -mthumb\
+      -mfloat-abi=soft\
+      -msingle-pic-base\
+      -mpic-register=r10\
+      -mno-pic-data-is-text-relative\
+	  -nostdlib\
+	  -Wl,--gc-sections\
+      -isystem $(NEWLIB_BASE_DIR_cortex-m)/arm/arm-none-eabi/include\
+      -isystem $(LIBCPP_BASE_DIR_cortex-m)/arm/arm-none-eabi/include/c++/$(LIBCPP_VERSION_cortex-m)\
+      -isystem $(LIBCPP_BASE_DIR_cortex-m)/arm/arm-none-eabi/include/c++/$(LIBCPP_VERSION_cortex-m)/arm-none-eabi
+
+# Each library Makefile needs to define these variables:
+#
+# - `$(LIBNAME)`: A name for the library. Ex: "libtock".
+# - `$($(LIBNAME)_DIR)`: The path to the directory the library Makefile is
+#   stored in. This is typically based on the `$(TOCK_USERLAND_BASE_DIR)`
+#   variable.
+# - `$($(LIBNAME)_SRCS)`: A list of source paths to compile for this library.
+$(call check_defined, LIBNAME)
+$(call check_defined, $(LIBNAME)_DIR)
+$(call check_defined, $(LIBNAME)_SRCS)
+
+# directory for built output
+$(LIBNAME)_BUILDDIR := $($(LIBNAME)_DIR)/build
+
+# Handle complex paths.
+#
+# Okay, so this merits some explanation:
+#
+# Our build system aspires to put everything in build/ directories, this means
+# that we have to match the path of source files (foo.c) to output directories
+# (build/<arch>/foo.o). That's easy enough if all the source files are in the
+# same directory, but restricts applications and libraries to a flat file
+# structure.
+#
+# The current solution we employ is built on make's VPATH variable, which is a
+# list of directories to search for dependencies, e.g.
+#
+#    VPATH = foo/ ../bar/
+#    somerule: dependency.c
+#
+# Will find any of ./dependency.c, foo/dependency.c, or ../bar/dependency.c
+# We leverage this by flattening the list of SRCS to remove all path
+# information and adding all the paths from the SRCS to the VPATH, this means
+# we can write rules as-if all the SRCS were in a flat directory.
+#
+# The obvious pitfall here is what happens when multiple directories hold a
+# source file of the same name. However, both libnrf and mbed are set up to
+# use VPATH without running into that problem, which gives some pretty serious
+# hope that it won't be an issue in practice. The day is actually is a problem,
+# we can revisit this, but the only solution I can think of presently is
+# another layer of macros that generates the build rules for each path in SRCS,
+# which is a pretty hairy sounding proposition
+
+$(LIBNAME)_SRCS_FLAT := $(notdir $($(LIBNAME)_SRCS))
+$(LIBNAME)_SRCS_DIRS := $(sort $(dir $($(LIBNAME)_SRCS))) # sort removes duplicates
+
+# Only use vpath for certain types of files
+# But must be a global list
+VPATH_DIRS += $(TOCK_USERLAND_BASE_DIR)
+vpath %.h $(VPATH_DIRS)
+vpath %.s $(VPATH_DIRS)
+vpath %.c $(VPATH_DIRS)
+vpath %.cc $(VPATH_DIRS)
+vpath %.cpp $(VPATH_DIRS)
+vpath %.cxx $(VPATH_DIRS)
+
+# Now, VPATH allows _make_ to find all the sources, but gcc needs to be told
+# how to find all of the headers. We do this by `-I`'ing any folder that had a
+# LIB_SRC and has any .h files in it. We also check the common convention of
+# headers in an include/ folder (both in and adjacent to src/) while we're at it.
+define LIB_HEADER_INCLUDES
+ifneq ($$(wildcard $(1)/*.h),"")
+  CPPFLAGS_$(LIBNAME) += -I$(1)
+endif
+ifneq ($$(wildcard $(1)/include/*.h),"")
+  CPPFLAGS_$(LIBNAME) += -I$(1)include
+endif
+ifneq ($$(wildcard $(1)/../include/*.h),"")
+  CPPFLAGS_$(LIBNAME) += -I$(1)../include
+endif
+endef
+# uncomment to print generated rules
+# $(info $(foreach hdrdir,$($(LIBNAME)_SRCS_DIRS),$(call LIB_HEADER_INCLUDES,$(hdrdir))))
+# actually generate the rules
+$(foreach hdrdir,$($(LIBNAME)_SRCS_DIRS),$(eval $(call LIB_HEADER_INCLUDES,$(hdrdir))))
+
+# Rules to generate libraries for a given Architecture
+# These will be used to create the different architecture versions of libraries.
+#
+# Argument $(1) is the Architecture (e.g. cortex-m0) to build for
+define LIB_RULES
+
+$$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME):
+	$$(TRACE_DIR)
+	$$(Q)mkdir -p $$@
+
+$$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME)/%.o: %.cpp | $$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME) $$(SYSTEM_LIBS_$(1))
+	$$(TRACE_CC)
+	$$(Q)mkdir -p $$(dir $$@)
+	$$(Q)$$(TOOLCHAIN_$(1))$$(CXX) $$(CXXFLAGS) $$(CPPFLAGS) $$(CPPFLAGS_$(1)) $$(CPPFLAGS_$(LIBNAME)) -c -o $$@ $$<
+
+# | $$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME) $$(SYSTEM_LIBS_$(1))
+
+$$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME)/%.o: %.c 
+	$$(TRACE_CC)
+	$$(Q)mkdir -p $$(dir $$@)
+	$$(Q)$$(TOOLCHAIN_$(1))$$(CC_$(1)) $$(CFLAGS) $$(CFLAGS_$(1)) $$(CPPFLAGS) $$(CPPFLAGS_$(1)) $$(CPPFLAGS_$(LIBNAME)) -c -o $$@ $$<
+
+$$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME)/%.o: %.S | $$($(LIBNAME)_BUILDDIR)/$(1) $$(SYSTEM_LIBS_$(1))
+	$$(TRACE_AS)
+	$$(Q)mkdir -p $$(dir $$@)
+	$$(Q)$$(TOOLCHAIN_$(1))$$(AS) $$(ASFLAGS) $$(CPPFLAGS) $$(CPPFLAGS_$(1)) -c -o $$@ $$<
+
+$(LIBNAME)_OBJS_$(1) += $$(patsubst $$(TOCK_USERLAND_BASE_DIR)/%.s,$$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME)/%.o,$$(filter %.s, $$($(LIBNAME)_SRCS)))
+$(LIBNAME)_OBJS_$(1) += $$(patsubst $$(TOCK_USERLAND_BASE_DIR)/%.c,$$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME)/%.o,$$(filter %.c, $$($(LIBNAME)_SRCS)))
+$(LIBNAME)_OBJS_$(1) += $$(patsubst $$(TOCK_USERLAND_BASE_DIR)/%.cc,$$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME)/%.o,$$(filter %.cc, $$($(LIBNAME)_SRCS)))
+$(LIBNAME)_OBJS_$(1) += $$(patsubst $$(TOCK_USERLAND_BASE_DIR)/%.cpp,$$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME)/%.o,$$(filter %.cpp, $$($(LIBNAME)_SRCS)))
+$(LIBNAME)_OBJS_$(1) += $$(patsubst $$(TOCK_USERLAND_BASE_DIR)/%.cxx,$$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME)/%.o,$$(filter %.cxx, $$($(LIBNAME)_SRCS)))
+
+# Dependency rules for picking up header changes
+-include $$($(LIBNAME)_OBJS_$(1):.o=.d)
+
+# Useful debugging
+# $$(info -----------------------------------------------------)
+# $$(info $(LIBNAME) $(1))
+# $$(info      $(LIBNAME)_SRCS: $$($(LIBNAME)_SRCS))
+# $$(info $(LIBNAME)_SRCS_FLAT: $$($(LIBNAME)_SRCS_FLAT))
+# $$(info                VPATH: $$(VPATH))
+# $$(info $(LIBNAME)_OBJS_$(1): $$($(LIBNAME)_OBJS_$(1)))
+# $$(info =====================================================)
+
+# Tockloader expects the .so to be named after the architecture.
+# However, but when passing in the -l option to gcc, it
+# expects to find lib<name>.so, so we copy the output to that name.
+$$($(LIBNAME)_BUILDDIR)/$(1)/$(1).so: $$($(LIBNAME)_OBJS_$(1)) 
+	$$(TRACE_CC)
+	$$(Q)mkdir -p $$(dir $$@)
+	$$(Q)$$(TOOLCHAIN_$(1))$$(CXX) -shared $$(CXXFLAGS) $$(CPPFLAGS) $$(CPPFLAGS_$(1)) $$(CPPFLAGS_$(LIBNAME)) -T userland_shlib_script.ld -o $$@ $$<
+	cp $$@ $$($(LIBNAME)_BUILDDIR)/$(1)/$(LIBNAME).so
+	@echo "Built $$($(LIBNAME)_BUILDDIR)/$(1)/$(1).so"
+
+# If we're building this library as part of a bigger build, add ourselves to
+# the list of libraries
+#
+# Ahh.. make. By default, the RHS of variables aren't expanded at all until the
+# variable is _used_ ("lazy set", "="), this means that LIBNAME will have
+# changed by the time the variable is evaluated. We want immediate set (":="),
+# but we'd also like to append ("+=") to grow the list. Append chooses between
+# lazy or immediate set based on how the variable was previously set (yes,
+# that's right, the RHS evaluation depends on the LHS type - make was ahead of
+# it's time! :D), and defaults to lazy set if the variable is undefined at the
+# first append. So, we force it to immediate set. Lovely.
+ifndef LIBS_$(1)
+  LIBS_$(1) :=
+endif
+LIBS_$(1) += $$($(LIBNAME)_BUILDDIR)/$(1)/$(1).so
+
+endef
+
+# uncomment to print generated rules
+# $(info $(foreach platform,$(TOCK_ARCHS), $(call LIB_RULES,$(arch))))
+# actually generate the rules for each architecture
+$(foreach arch,$(TOCK_ARCHS),$(eval $(call LIB_RULES,$(arch))))
+
+# add each architecture as a target
+.PHONY: all
+all: $(foreach arch, $(TOCK_ARCHS),$($(LIBNAME)_BUILDDIR)/$(arch)/$(arch).so)
+
+
+# Force LIBNAME to be expanded now
+define CLEAN_RULE
+.PHONY: clean
+clean::
+	rm -Rf $(1)
+endef
+$(eval $(call CLEAN_RULE,$($(LIBNAME)_BUILDDIR)))
+
+
+# Rules for running the C linter
+$(LIBNAME)_FORMATTED_FILES := $(patsubst $(TOCK_USERLAND_BASE_DIR)/%.c,  $($(LIBNAME)_BUILDDIR)/format/%.uncrustify,$(filter %.c,   $($(LIBNAME)_SRCS)))
+$(LIBNAME)_FORMATTED_FILES += $(patsubst $(TOCK_USERLAND_BASE_DIR)/%.cc, $($(LIBNAME)_BUILDDIR)/format/%.uncrustify,$(filter %.cc,  $($(LIBNAME)_SRCS)))
+$(LIBNAME)_FORMATTED_FILES += $(patsubst $(TOCK_USERLAND_BASE_DIR)/%.cpp,$($(LIBNAME)_BUILDDIR)/format/%.uncrustify,$(filter %.cpp, $($(LIBNAME)_SRCS)))
+$(LIBNAME)_FORMATTED_FILES += $(patsubst $(TOCK_USERLAND_BASE_DIR)/%.cxx,$($(LIBNAME)_BUILDDIR)/format/%.uncrustify,$(filter %.cxx, $($(LIBNAME)_SRCS)))
+
+# Add header files to the formatter.
+$(LIBNAME)_HEADER_FILES := $(wildcard $(addsuffix *.h,$(sort $(dir $($(LIBNAME)_SRCS)))))
+$(LIBNAME)_FORMATTED_FILES += $(patsubst $(TOCK_USERLAND_BASE_DIR)/%.h, $($(LIBNAME)_BUILDDIR)/format/%.h.uncrustify,$($(LIBNAME)_HEADER_FILES))
+
+$($(LIBNAME)_BUILDDIR)/format:
+	@mkdir -p $@
+
+.PHONY: fmt format
+fmt format:: $($(LIBNAME)_FORMATTED_FILES)
+
+$($(LIBNAME)_BUILDDIR)/format/%.uncrustify: %.c $(TOCK_USERLAND_BASE_DIR)/tools/uncrustify/uncrustify.cfg | _format_check_unstaged
+	$(Q)$(UNCRUSTIFY) -f $< -o $@
+	$(Q)cmp -s $< $@ || (if [ "$$CI" = "true" ]; then diff -y $< $@; rm $@; exit 1; else cp $@ $<; fi)
+$($(LIBNAME)_BUILDDIR)/format/%.h.uncrustify: %.h $(TOCK_USERLAND_BASE_DIR)/tools/uncrustify/uncrustify.cfg | _format_check_unstaged
+	$(Q)$(UNCRUSTIFY) -f $< -o $@
+	$(Q)cmp -s $< $@ || (if [ "$$CI" = "true" ]; then diff -y $< $@; rm $@; exit 1; else cp $@ $<; fi)
+$($(LIBNAME)_BUILDDIR)/format/%.uncrustify: %.cc $(TOCK_USERLAND_BASE_DIR)/tools/uncrustify/uncrustify.cfg | _format_check_unstaged
+	$(Q)$(UNCRUSTIFY) -f $< -o $@
+	$(Q)cmp -s $< $@ || (if [ "$$CI" = "true" ]; then diff -y $< $@; rm $@; exit 1; else cp $@ $<; fi)
+$($(LIBNAME)_BUILDDIR)/format/%.uncrustify: %.cpp $(TOCK_USERLAND_BASE_DIR)/tools/uncrustify/uncrustify.cfg | _format_check_unstaged
+	$(Q)$(UNCRUSTIFY) -f $< -o $@
+	$(Q)cmp -s $< $@ || (if [ "$$CI" = "true" ]; then diff -y $< $@; rm $@; exit 1; else cp $@ $<; fi)
+$($(LIBNAME)_BUILDDIR)/format/%.uncrustify: %.cxx $(TOCK_USERLAND_BASE_DIR)/tools/uncrustify/uncrustify.cfg | _format_check_unstaged
+	$(Q)$(UNCRUSTIFY) -f $< -o $@
+	$(Q)cmp -s $< $@ || (if [ "$$CI" = "true" ]; then diff -y $< $@; rm $@; exit 1; else cp $@ $<; fi)
